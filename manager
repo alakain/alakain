@@ -1,0 +1,800 @@
+import tkinter as tk
+from tkinter import ttk
+from functools import partial
+import psutil
+import win32gui
+import win32process
+from collections import deque
+import time
+import os
+import sys
+from tkinter import messagebox
+
+
+# Lista de procesos suspendidos
+procesos_suspendidos = []
+PROCESOS_RECOMENDADOS = [
+    "explorer.exe", "TiWorker.exe", "SearchIndexer.exe",
+    "MicrosoftEdge.exe", "OneDrive.exe", "EdgeUpdate.exe",
+    "Teams.exe", "chrome.exe", "Discord.exe", "Spotify.exe"
+]
+
+# ==================== FUNCIONES BASE ====================
+def obtener_aplicaciones_activas():
+    def callback(hwnd, aplicaciones):
+        if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            try:
+                proceso = psutil.Process(pid)
+                if not proceso.name().startswith("fast_cat_") and proceso not in procesos_suspendidos:
+                    aplicaciones.append({
+                        "ventana": win32gui.GetWindowText(hwnd),
+                        "pid": pid,
+                        "nombre": proceso.name(),
+                        "estado": "Activo"
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return True
+
+    aplicaciones = []
+    win32gui.EnumWindows(callback, aplicaciones)
+    for proceso in procesos_suspendidos:
+        aplicaciones.append({
+            "ventana": "Suspendido",
+            "pid": proceso.pid,
+            "nombre": proceso.name(),
+            "estado": "Suspendido"
+        })
+    return aplicaciones
+
+def suspender_proceso(pid):
+    try:
+        proceso = psutil.Process(pid)
+        if proceso.status() == psutil.STATUS_RUNNING:
+            proceso.suspend()
+            procesos_suspendidos.append(proceso)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        print("Error al suspender el proceso")
+
+def restaurar_suspendidos():
+    for proceso in procesos_suspendidos[:]:
+        try:
+            proceso.resume()
+            procesos_suspendidos.remove(proceso)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            procesos_suspendidos.remove(proceso)
+
+def cerrar_suspendido(pid):
+    for proceso in procesos_suspendidos[:]:
+        if proceso.pid == pid:
+            try:
+                proceso.kill()
+                procesos_suspendidos.remove(proceso)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                procesos_suspendidos.remove(proceso)
+
+# ==================== VENTANA RECURSOS ====================
+class VentanaRecursos(tk.Toplevel):
+    def __init__(self, ventana_principal):
+        super().__init__(ventana_principal)
+        self.ventana_principal = ventana_principal
+        
+        # Configuración inicial
+        self.configure(bg="black")
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.7)
+        self.geometry("350x180")
+        
+        # Inicialización de variables
+        self.disk_io_history = deque(maxlen=5)
+        self.net_history = deque(maxlen=5)
+        self.arrastrando = False
+        self.frecuencia_actualizacion = tk.IntVar(value=300)
+        self.ventana_config = None
+        
+        # Variables para monitoreo de proceso
+        self.proceso_monitoreado = None
+        self.pid_monitoreado = None
+        self.nombre_proceso = ""
+        
+        # Configuración de historiales
+        self.historial = {
+            "cpu": deque(maxlen=50),
+            "ram": deque(maxlen=50),
+            "disco": deque(maxlen=50),
+            "red": deque(maxlen=50)
+        }
+
+        # Configuración de colores
+        self.colores = {
+            "cpu": "#FF5555",    # Rojo
+            "ram": "#55FF55",    # Verde
+            "disco": "#FFAA00",  # Naranja
+            "red": "#5555FF"     # Azul
+        }
+
+        # Crear elementos de la interfaz
+        self.crear_area_arrastre()
+        self.crear_botones()
+        self.crear_etiquetas()
+        self.crear_grafica()
+        
+        # Etiqueta para proceso monitoreado
+        self.label_proceso = tk.Label(
+            self,
+            text="Monitoreando: Sistema",
+            font=("Arial", 8),
+            bg="black",
+            fg="white"
+        )
+        self.label_proceso.place(x=25, y=130, width=120, height=20)
+        
+        # Iniciar actualización
+        self.actualizar_datos()
+
+    def crear_area_arrastre(self):
+        self.area_arrastre = tk.Label(
+            self, text="║", font=("Arial", 8), 
+            bg="black", fg="white"
+        )
+        self.area_arrastre.place(x=0, y=0, width=20, height=180)
+        self.area_arrastre.bind("<Button-1>", self.iniciar_arrastre)
+        self.area_arrastre.bind("<B1-Motion>", self.mover_ventana)
+
+    def crear_botones(self):
+        # Botón de configuración
+        self.btn_config = tk.Button(
+            self, text="⚙", font=("Arial", 8),
+            bg="black", fg="white", bd=0,
+            command=self.abrir_configuracion
+        )
+        self.btn_config.place(x=300, y=5, width=20, height=20)
+
+        # Botón cerrar
+        self.boton_cerrar = tk.Button(
+            self, text="✖", command=self.destroy,
+            bg="black", fg="white", bd=0, font=("Arial", 8)
+        )
+        self.boton_cerrar.place(x=325, y=5, width=20, height=20)
+
+    def crear_etiquetas(self):
+        y_pos = 10
+        self.labels = {}
+        for metric in ["cpu", "ram", "disco", "red"]:
+            # Cuadro de color
+            tk.Canvas(
+                self, width=12, height=12, 
+                bg=self.colores[metric], highlightthickness=0
+            ).place(x=25, y=y_pos)
+            
+            # Etiqueta de valor
+            self.labels[metric] = tk.Label(
+                self, text="...", font=("Arial", 9), 
+                bg="black", fg="white", anchor="w"
+            )
+            self.labels[metric].place(x=40, y=y_pos-2, width=120, height=20)
+            y_pos += 30
+
+    def crear_grafica(self):
+        self.grafica_combinada = tk.Canvas(
+            self, bg="black", width=180, height=130, 
+            highlightthickness=0
+        )
+        self.grafica_combinada.place(x=160, y=40)
+
+    def abrir_configuracion(self):
+        """Abre ventana de configuración si no existe ya"""
+        if self.ventana_config is None or not self.ventana_config.winfo_exists():
+            self.ventana_config = tk.Toplevel(self)
+            self.ventana_config.title("Configuración")
+            self.ventana_config.geometry("300x150")
+            self.ventana_config.configure(bg="black")
+            self.ventana_config.overrideredirect(True)
+            
+            # Centrar la ventana de configuración
+            x = self.winfo_x() + (self.winfo_width() - 300) // 2
+            y = self.winfo_y() + (self.winfo_height()+200) // 2
+            self.ventana_config.geometry(f"300x150+{x}+{y}")
+            
+            # Frame para la configuración
+            frame = tk.Frame(self.ventana_config, bg="black")
+            frame.pack(pady=20)
+            
+            # Botón de cerrar
+            tk.Button(
+                frame,
+                text="✖",
+                command=self.ventana_config.destroy,
+                bg="black", fg="white",
+                bd=0,
+                font=("Arial", 8)
+            ).pack(anchor='ne')
+            
+            # Slider para la frecuencia
+            tk.Label(
+                frame,
+                text="Frecuencia de actualización (ms):",
+                bg="black", fg="white"
+            ).pack(pady=5)
+            
+            tk.Scale(
+                frame,
+                from_=100,
+                to=1000,
+                orient="horizontal",
+                variable=self.frecuencia_actualizacion,
+                bg="black", fg="white",
+                length=200
+            ).pack(pady=10)
+
+    def iniciar_arrastre(self, event):
+        self.arrastrando = True
+        self._x = event.x
+        self._y = event.y
+
+    def mover_ventana(self, event):
+        if self.arrastrando:
+            x = self.winfo_x() + (event.x - self._x)
+            y = self.winfo_y() + (event.y - self._y)
+            self.geometry(f"+{x}+{y}")
+
+    def monitorear_proceso(self, pid):
+        """Cambia el monitoreo a un proceso específico"""
+        try:
+            self.proceso_monitoreado = psutil.Process(pid)
+            self.pid_monitoreado = pid
+            self.nombre_proceso = self.proceso_monitoreado.name()
+            self.label_proceso.config(
+                text=f"PID: {pid}\n{self.nombre_proceso[:15]}..."
+                if len(self.nombre_proceso) > 15
+                else f"PID: {pid}\n{self.nombre_proceso}"
+            )
+            # Limpiar historiales
+            for metrica in self.historial:
+                self.historial[metrica].clear()
+        except psutil.NoSuchProcess:
+            self.detener_monitoreo_proceso()
+        except Exception as e:
+            print(f"Error al iniciar monitoreo: {e}")
+            self.detener_monitoreo_proceso()
+
+    def detener_monitoreo_proceso(self):
+        """Vuelve al monitoreo del sistema"""
+        self.proceso_monitoreado = None
+        self.pid_monitoreado = None
+        self.nombre_proceso = ""
+        self.label_proceso.config(text="Monitoreando: Sistema")
+        # Limpiar historiales
+        for metrica in self.historial:
+            self.historial[metrica].clear()
+
+    def actualizar_datos(self):
+        try:
+            if self.proceso_monitoreado:
+                try:
+                    # CPU del proceso
+                    cpu_percent = self.proceso_monitoreado.cpu_percent()
+                    
+                    # RAM del proceso
+                    ram_info = self.proceso_monitoreado.memory_info()
+                    ram_percent = (ram_info.rss / psutil.virtual_memory().total) * 100
+                    
+                    # Disco del proceso
+                    disk_speed = 0.0
+                    try:
+                        disk_io = self.proceso_monitoreado.io_counters()
+                        if self.disk_io_history:
+                            last = self.disk_io_history[-1]
+                            elapsed = time.time() - last[0]
+                            if elapsed > 0:
+                                read = (disk_io.read_bytes - last[1]) / (1024**2) / elapsed
+                                write = (disk_io.write_bytes - last[2]) / (1024**2) / elapsed
+                                disk_speed = read + write
+                        self.disk_io_history.append((time.time(), disk_io.read_bytes, disk_io.write_bytes))
+                    except (psutil.NoSuchProcess, AttributeError):
+                        pass
+                    
+                    # Red del proceso (aproximación)
+                    net_speed = 0.0
+                    try:
+                        connections = self.proceso_monitoreado.connections()
+                        net_speed = len(connections)  # Simplificado a número de conexiones
+                    except (psutil.NoSuchProcess, AttributeError):
+                        pass
+
+                except psutil.NoSuchProcess:
+                    self.detener_monitoreo_proceso()
+                    return
+            else:
+                # Monitoreo del sistema
+                cpu_percent = psutil.cpu_percent()
+                ram_percent = psutil.virtual_memory().percent
+                
+                # Disco (MB/s totales)
+                disk = psutil.disk_io_counters()
+                disk_speed = 0.0
+                if self.disk_io_history:
+                    last = self.disk_io_history[-1]
+                    elapsed = time.time() - last[0]
+                    if elapsed > 0:
+                        read = (disk.read_bytes - last[1]) / (1024**2) / elapsed
+                        write = (disk.write_bytes - last[2]) / (1024**2) / elapsed
+                        disk_speed = read + write
+                self.disk_io_history.append((time.time(), disk.read_bytes, disk.write_bytes))
+                
+                # Red (Kbps descarga)
+                net = psutil.net_io_counters()
+                net_speed = 0.0
+                if self.net_history:
+                    last = self.net_history[-1]
+                    elapsed = time.time() - last[0]
+                    if elapsed > 0:
+                        net_speed = (net.bytes_recv - last[2]) / 1024 / elapsed
+                self.net_history.append((time.time(), net.bytes_sent, net.bytes_recv))
+            
+            # Actualizar historiales
+            self.historial["cpu"].append(cpu_percent)
+            self.historial["ram"].append(ram_percent)
+            self.historial["disco"].append(disk_speed)
+            self.historial["red"].append(net_speed)
+            
+            # Actualizar etiquetas
+            self.labels["cpu"].config(text=f"CPU: {cpu_percent:.1f}%")
+            self.labels["ram"].config(text=f"RAM: {ram_percent:.1f}%")
+            self.labels["disco"].config(text=f"Disco: {disk_speed:.1f}MB/s")
+            self.labels["red"].config(text=f"Red: {net_speed:.1f}Kbps")
+            
+            # Dibujar gráfica
+            self.dibujar_grafica_combinada()
+            
+        
+        except Exception as e:
+            print(f"Error actualizando recursos: {str(e)}")
+        
+        self.after(self.frecuencia_actualizacion.get(), self.actualizar_datos)
+            
+
+    def dibujar_grafica_combinada(self):
+        self.grafica_combinada.delete("all")
+        
+        # Usar los máximos detectados del sistema
+        maximos = {
+            "cpu": 100,  # CPU siempre en porcentaje
+            "ram": 100,  # Convertir a MB para coincidir con las mediciones
+            "disco": 50,
+            "red": 1000  # 1 MB/s como máximo para red
+        }
+        # Forzar mínimos para visualización
+        maximos["cpu"] = max(maximos["cpu"], 1)
+        maximos["ram"] = max(maximos["ram"], 1)
+        maximos["disco"] = max(maximos["disco"], 1)
+        maximos["red"] = max(maximos["red"], 1)
+
+        # ========= DIBUJAR CADA MÉTRICA =========
+        for metric in ["cpu", "ram", "disco", "red"]:
+            puntos = []
+            valores = list(self.historial[metric])
+            max_val = maximos[metric]
+            max_points = self.historial[metric].maxlen  # Por ejemplo, 50
+            current_points = len(valores)
+            spacing = 180 / (max_points - 1)  # Separación fija basada en el número máximo de puntos
+            offset = max_points - current_points  # Desplazamiento para que el último dato quede a la derecha
+
+            for i, val in enumerate(valores):
+                x = (offset + i) * spacing
+                # Calcular y usando la escala en Y (más adelante)
+                y = 120 - (val / max_val) * 115  # Puedes ajustar el margen
+                puntos.extend([x, y])
+
+                        
+            if len(puntos) >= 4:
+                self.grafica_combinada.create_line(
+                    puntos, 
+                    fill=self.colores[metric], 
+                    width=1.5, 
+                    smooth=True
+                )
+        
+        # ========= LÍNEA BASE =========
+        self.grafica_combinada.create_line(0, 119, 180, 119, fill="#444444")
+# ==================== VENTANA PRINCIPAL ====================
+class VentanaPrincipal(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.geometry("130x50")
+        self.configure(bg="black")
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.5)
+        self.monitor_abierto = False
+        self.monitor_ventana = None
+        self.ventana_recursos = None
+    
+        # Botones principales
+        self.boton_monitor = tk.Button(
+            self, text="📂", font=("Arial", 12), bg="black", fg="white", bd=0,
+            command=self.toggle_monitor
+        )
+        self.boton_monitor.place(x=20, y=10, width=30, height=30)
+
+        self.boton_recursos = tk.Button(
+            self, text="📊", font=("Arial", 12), bg="black", fg="white", bd=0,
+            command=self.toggle_recursos
+        )
+        self.boton_recursos.place(x=52, y=10, width=30, height=30)
+
+        self.boton_cerrar = tk.Button(
+            self, text="❎", font=("Arial", 12), bg="black", fg="white", bd=0,
+            command=self.cerrar
+        )
+        self.boton_cerrar.place(x=90, y=10, width=30, height=30)
+
+        # Área de arrastre
+        self.area_arrastre = tk.Label(self, text="║", font=("Arial", 12), bg="black", fg="white")
+        self.area_arrastre.place(x=0, y=0, width=20, height=50)
+        self.area_arrastre.bind("<Button-1>", self.iniciar_arrastre)
+        self.area_arrastre.bind("<B1-Motion>", self.mover_ventana)
+    
+    def iniciar_arrastre(self, event):
+        self.arrastrando = True
+        self.inicio_x = event.x
+        self.inicio_y = event.y
+    
+    def mover_ventana(self, event):
+        if self.arrastrando:
+            x = self.winfo_x() + (event.x - self.inicio_x)
+            y = self.winfo_y() + (event.y - self.inicio_y)
+            self.geometry(f"+{x}+{y}")
+            
+            # Solo mueve el monitor de procesos junto a la ventana principal
+            if self.monitor_abierto and self.monitor_ventana:
+                self.monitor_ventana.geometry(f"+{x}+{y + 50}")
+    
+    def toggle_monitor(self):
+        if self.monitor_abierto:
+            if self.monitor_ventana:
+                self.monitor_ventana.destroy()
+            self.monitor_abierto = False
+        else:
+            self.monitor_abierto = True
+            self.monitor_ventana = VentanaMonitor(self)
+            self.monitor_ventana.geometry(f"+{self.winfo_x()}+{self.winfo_y() + 50}")
+    
+    def toggle_recursos(self):
+        if self.ventana_recursos and self.ventana_recursos.winfo_exists():
+            self.ventana_recursos.destroy()
+            self.ventana_recursos = None
+        else:
+            self.ventana_recursos = VentanaRecursos(self)
+            # Posición inicial relativa, pero no se actualizará al mover la principal
+            self.ventana_recursos.geometry(f"+{self.winfo_x() + 130}+{self.winfo_y()}")
+    
+    def cerrar(self):
+        restaurar_suspendidos()
+        self.destroy()
+
+# ==================== VENTANA MONITOR ====================
+class VentanaMonitor(tk.Toplevel):
+    def __init__(self, ventana_principal):
+        super().__init__(ventana_principal)
+        self.ventana_principal = ventana_principal
+        self.geometry("400x300")
+        self.configure(bg="black")
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.7)
+        self.indice_min = 0
+        self.indice_max = 9
+
+        # Estilo tabla
+        estilo = ttk.Style()
+        estilo.theme_use("alt")
+        estilo.configure("Treeview", 
+            background="black", 
+            foreground="white", 
+            fieldbackground="black",
+            borderwidth=0
+        )
+        estilo.configure("Treeview.Heading", 
+            background="black", 
+            foreground="white"
+        )
+        estilo.map("Treeview", background=[("selected", "#333333")])
+
+        # Componentes
+        self.tabla = ttk.Treeview(self, columns=("PID", "Nombre", "Estado", "Ventana"), show="headings")
+        self.tabla.heading("PID", text="PID", anchor="center")
+        self.tabla.column("PID", width=60, anchor="center")
+        self.tabla.heading("Nombre", text="Nombre")
+        self.tabla.column("Nombre", width=120)
+        self.tabla.heading("Estado", text="Edo", anchor="center")
+        self.tabla.column("Estado", width=60, anchor="center")
+        self.tabla.heading("Ventana", text="Ventana")
+        self.tabla.column("Ventana", width=160)
+        self.tabla.pack(fill=tk.BOTH, expand=True)
+        
+        # Botones
+        botones_frame = tk.Frame(self, bg="black")
+        botones_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Botones de navegación (izquierda)
+        nav_frame = tk.Frame(botones_frame, bg="black")
+        nav_frame.pack(side=tk.LEFT)
+        
+        tk.Button(
+            nav_frame, text="◄", font=("Arial", 12),
+            bg="black", fg="white", bd=0,
+            command=self.pagina_anterior
+        ).pack(side=tk.LEFT, padx=2)
+        
+        tk.Button(
+            nav_frame, text="►", font=("Arial", 12),
+            bg="black", fg="white", bd=0,
+            command=self.pagina_siguiente
+        ).pack(side=tk.LEFT, padx=2)
+        
+        # Botones de acción (centro)
+        simbolos = {
+            "⏏︎": self.suspender_recomendados,
+            "⏸︎": partial(self.ejecutar_comando, "suspender"),
+            "▶︎": partial(self.ejecutar_comando, "restaurar"),
+            "✖︎": partial(self.ejecutar_comando, "cerrar"),
+            "📊": self.monitorear_seleccionado,
+            "🔄": self.detener_monitoreo,
+            "📝": self.abrir_editor_procesos  # editar lista 
+        }
+              
+        for texto, comando in simbolos.items():
+            tk.Button(
+                botones_frame, text=texto, font=("Arial", 12),
+                bg="black", fg="white", bd=0, command=comando
+            ).pack(side=tk.LEFT, padx=5)
+        
+        self.actualizar_tabla()
+
+    def abrir_editor_procesos(self):
+        """Abre el editor de procesos recomendados"""
+        if not hasattr(self, 'ventana_editor') or not self.ventana_editor.winfo_exists():
+            self.ventana_editor = EditorProcesos(self)
+
+    def pagina_anterior(self):
+        if self.indice_min > 0:
+            self.indice_min -= 10
+            self.indice_max -= 10
+            self.actualizar_tabla()
+
+    def pagina_siguiente(self):
+        aplicaciones = obtener_aplicaciones_activas()
+        if self.indice_max < len(aplicaciones) - 1:
+            self.indice_min += 10
+            self.indice_max += 10
+            self.actualizar_tabla()
+
+    def actualizar_tabla(self):
+        aplicaciones = obtener_aplicaciones_activas()
+        self.tabla.delete(*self.tabla.get_children())
+        for app in aplicaciones[self.indice_min:self.indice_max + 1]:
+            self.tabla.insert("", "end", values=(
+                app["pid"],
+                app["nombre"],
+                "Sus" if app["estado"] == "Suspendido" else "Act",
+                app["ventana"]
+            ))
+    
+    def ejecutar_comando(self, accion):
+        seleccion = self.tabla.focus()
+        if seleccion:
+            valores = self.tabla.item(seleccion, "values")
+            pid = int(valores[0])
+            if accion == "suspender":
+                suspender_proceso(pid)
+            elif accion == "restaurar":
+                for proceso in procesos_suspendidos[:]:
+                    if proceso.pid == pid:
+                        proceso.resume()
+                        procesos_suspendidos.remove(proceso)
+            elif accion == "cerrar":
+                cerrar_suspendido(pid)
+            self.actualizar_tabla()
+    
+    def suspender_recomendados(self):
+        aplicaciones = obtener_aplicaciones_activas()
+        for app in aplicaciones:
+            if app["nombre"] in PROCESOS_RECOMENDADOS and app["estado"] == "Activo":
+                suspender_proceso(app["pid"])
+        self.actualizar_tabla()
+
+    def monitorear_seleccionado(self):
+        """Inicia el monitoreo del proceso seleccionado"""
+        seleccion = self.tabla.focus()
+        if seleccion:
+            valores = self.tabla.item(seleccion, "values")
+            pid = int(valores[0])
+            # Verificar si la ventana de recursos existe
+            if hasattr(self.ventana_principal, 'ventana_recursos') and self.ventana_principal.ventana_recursos:
+                self.ventana_principal.ventana_recursos.monitorear_proceso(pid)
+            else:
+                # Crear ventana de recursos si no existe
+                self.ventana_principal.ventana_recursos = VentanaRecursos(self.ventana_principal)
+                self.ventana_principal.ventana_recursos.monitorear_proceso(pid)
+
+    def detener_monitoreo(self):
+        """Detiene el monitoreo específico y vuelve al monitoreo del sistema"""
+        if hasattr(self.ventana_principal, 'ventana_recursos') and self.ventana_principal.ventana_recursos:
+            self.ventana_principal.ventana_recursos.detener_monitoreo_proceso()
+    
+    def iniciar_arrastre(self, event):
+        self.arrastrando = True
+        self._x = event.x
+        self._y = event.y
+
+    def mover_ventana(self, event):
+        if self.arrastrando:
+            x = self.winfo_x() + (event.x - self._x)
+            y = self.winfo_y() + (event.y - self._y)
+            self.geometry(f"+{x}+{y}")
+
+######################################################################
+class EditorProcesos(tk.Toplevel):
+    def __init__(self, ventana_principal):
+        super().__init__(ventana_principal)
+        self.ventana_principal = ventana_principal
+        
+        # Configuración de la ventana
+        self.geometry("250x300")
+        self.configure(bg="black")
+        self.overrideredirect(True)
+        self.attributes("-alpha", 0.75)
+        self.attributes("-topmost", True)
+
+        # Frame principal
+        self.frame = tk.Frame(self, bg="black")
+        self.frame.pack(expand=True, fill='both', padx=5, pady=5)
+
+        # Título y botón cerrar
+        titulo_frame = tk.Frame(self.frame, bg="black")
+        titulo_frame.pack(fill='x', pady=(0, 5))
+        
+        tk.Label(
+            titulo_frame,
+            text="Procesos Automáticos",
+            bg="black", fg="white",
+            font=("Arial", 8)
+        ).pack(side=tk.LEFT)
+        
+        tk.Button(
+            titulo_frame,
+            text="✖",
+            command=self.destroy,
+            bg="black", fg="white",
+            bd=0, font=("Arial", 8)
+        ).pack(side=tk.RIGHT)
+
+        # Lista con barra
+        lista_frame = tk.Frame(self.frame, bg="black")
+        lista_frame.pack(fill='both', expand=True)
+        
+        scrollbar = tk.Scrollbar(lista_frame)
+        scrollbar.pack(side=tk.RIGHT, fill='y')
+        
+        self.lista_procesos = tk.Listbox(
+            lista_frame,
+            bg="#111111",
+            fg="white",
+            selectmode=tk.SINGLE,
+            height=10,
+            yscrollcommand=scrollbar.set
+        )
+        self.lista_procesos.pack(side=tk.LEFT, fill='both', expand=True)
+        scrollbar.config(command=self.lista_procesos.yview)
+
+        # Frame para entrada y botones
+        control_frame = tk.Frame(self.frame, bg="black")
+        control_frame.pack(fill='x', pady=5)
+        
+        self.entrada = tk.Entry(
+            control_frame,
+            bg="#111111",
+            fg="white",
+            insertbackground="white"
+        )
+        self.entrada.pack(side=tk.LEFT, expand=True, fill='x')
+        
+        tk.Button(
+            control_frame,
+            text="➕",
+            command=self.agregar_proceso,
+            bg="black", fg="white",
+            bd=0
+        ).pack(side=tk.LEFT, padx=2)
+        
+        tk.Button(
+            control_frame,
+            text="➖",
+            command=self.eliminar_proceso,
+            bg="black", fg="white",
+            bd=0
+        ).pack(side=tk.LEFT)
+
+        # Hacer la ventana arrastrable
+        titulo_frame.bind('<Button-1>', self.iniciar_arrastre)
+        titulo_frame.bind('<B1-Motion>', self.mover_ventana)
+
+        # Cargar procesos guardados
+        self.cargar_procesos()
+
+    def iniciar_arrastre(self, event):
+        self._drag_data = {'x': event.x, 'y': event.y}
+
+    def mover_ventana(self, event):
+        if hasattr(self, '_drag_data'):
+            x = self.winfo_x() + (event.x - self._drag_data['x'])
+            y = self.winfo_y() + (event.y - self._drag_data['y'])
+            self.geometry(f"+{x}+{y}")
+
+   
+    def obtener_ruta_archivo(self):
+        """Obtiene la ruta correcta del archivo tanto en desarrollo como en el exe"""
+        if getattr(sys, 'frozen', False):
+            # Si estamos en el exe
+            return os.path.join(sys._MEIPASS, 'procesos_recomendados.txt')
+        else:
+            # Si estamos en desarrollo
+            return os.path.join(os.path.dirname(__file__), 'procesos_recomendados.txt')
+
+    def cargar_procesos(self):
+        """Carga los procesos desde el archivo"""
+        try:
+            ruta = self.obtener_ruta_archivo()
+            with open(ruta, 'r') as f:
+                procesos = f.read().splitlines()
+            global PROCESOS_RECOMENDADOS
+            PROCESOS_RECOMENDADOS = [p for p in procesos if p.strip()]
+            self.actualizar_lista()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo cargar la lista de procesos: {str(e)}")
+            PROCESOS_RECOMENDADOS = []
+
+    def guardar_procesos(self):
+        """
+        Guarda los procesos en un archivo temporal fuera del exe
+        para mantener los cambios entre sesiones
+        """
+        ruta_temp = os.path.join(os.path.expanduser('~'), '.procesos_temp.txt')
+        try:
+            with open(ruta_temp, 'w') as f:
+                for proceso in PROCESOS_RECOMENDADOS:
+                    f.write(proceso + '\n')
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo guardar la lista de procesos: {str(e)}")
+
+    
+    def actualizar_lista(self):
+        """Actualiza la lista visual con los procesos actuales"""
+        self.lista_procesos.delete(0, tk.END)
+        for proceso in PROCESOS_RECOMENDADOS:
+            self.lista_procesos.insert(tk.END, proceso)
+
+    def agregar_proceso(self):
+        """Agrega un nuevo proceso a la lista"""
+        proceso = self.entrada.get().strip()
+        if proceso and proceso not in PROCESOS_RECOMENDADOS:
+            PROCESOS_RECOMENDADOS.append(proceso)
+            self.entrada.delete(0, tk.END)
+            self.actualizar_lista()
+            self.guardar_procesos()
+
+    def eliminar_proceso(self):
+        """Elimina el proceso seleccionado de la lista"""
+        seleccion = self.lista_procesos.curselection()
+        if seleccion:
+            proceso = self.lista_procesos.get(seleccion)
+            PROCESOS_RECOMENDADOS.remove(proceso)
+            self.actualizar_lista()
+            self.guardar_procesos()
+
+if __name__ == "__main__":
+    app = VentanaPrincipal()
+    app.mainloop()
